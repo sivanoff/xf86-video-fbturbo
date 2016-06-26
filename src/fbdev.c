@@ -34,6 +34,12 @@
 #endif
 
 #include <string.h>
+#include <linux/fb.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
 
 /* all driver need this */
 #include "xf86.h"
@@ -49,14 +55,11 @@
 #include "cpu_backend.h"
 #include "fb_copyarea.h"
 
-#include "sunxi_disp.h"
-#include "sunxi_disp_hwcursor.h"
-#include "sunxi_x_g2d.h"
+#include "fbdev_accel.h"
 #include "backing_store_tuner.h"
-#include "sunxi_video.h"
 
 #ifdef HAVE_LIBUMP
-#include "sunxi_mali_ump_dri2.h"
+#include "fbdev_mali_ump_dri2.h"
 #endif
 
 /* for visuals */
@@ -166,6 +169,7 @@ typedef enum {
 	OPTION_DEBUG,
 	OPTION_HW_CURSOR,
 	OPTION_SW_CURSOR,
+	OPTION_ALPHA_SWAP,
 	OPTION_DRI2,
 	OPTION_DRI2_OVERLAY,
 	OPTION_SWAPBUFFERS_WAIT,
@@ -180,15 +184,13 @@ static const OptionInfoRec FBDevOptions[] = {
 	{ OPTION_ROTATE,	"Rotate",	OPTV_STRING,	{0},	FALSE },
 	{ OPTION_FBDEV,		"fbdev",	OPTV_STRING,	{0},	FALSE },
 	{ OPTION_DEBUG,		"debug",	OPTV_BOOLEAN,	{0},	FALSE },
-	{ OPTION_HW_CURSOR,	"HWCursor",	OPTV_BOOLEAN,	{0},	FALSE },
-	{ OPTION_SW_CURSOR,	"SWCursor",	OPTV_BOOLEAN,	{0},	FALSE },
+	{ OPTION_ALPHA_SWAP,	"alpha_swap",	OPTV_BOOLEAN,	{0},	FALSE },
 	{ OPTION_DRI2,		"DRI2",		OPTV_BOOLEAN,	{0},	FALSE },
 	{ OPTION_DRI2_OVERLAY,	"DRI2HWOverlay",OPTV_BOOLEAN,	{0},	FALSE },
 	{ OPTION_SWAPBUFFERS_WAIT,"SwapbuffersWait",OPTV_BOOLEAN,{0},	FALSE },
 	{ OPTION_ACCELMETHOD,	"AccelMethod",	OPTV_STRING,	{0},	FALSE },
 	{ OPTION_USE_BS,	"UseBackingStore",OPTV_BOOLEAN,	{0},	FALSE },
 	{ OPTION_FORCE_BS,	"ForceBackingStore",OPTV_BOOLEAN,{0},	FALSE },
-	{ OPTION_XV_OVERLAY,	"XVHWOverlay",	OPTV_BOOLEAN,	{0},	FALSE },
 	{ -1,			NULL,		OPTV_NONE,	{0},	FALSE }
 };
 
@@ -431,10 +433,12 @@ static Bool
 FBDevPreInit(ScrnInfoPtr pScrn, int flags)
 {
 	FBDevPtr fPtr;
-	int default_depth, fbbpp;
+	int default_depth, fbbpp, ret;
+	int fbhandle = 0;
 	const char *s;
 	int type;
 	cpuinfo_t *cpuinfo;
+        struct fb_var_screeninfo info;
 
 	if (flags & PROBE_DETECT) return FALSE;
 
@@ -463,6 +467,24 @@ FBDevPreInit(ScrnInfoPtr pScrn, int flags)
 		return FALSE;
 	}
 #endif
+	if (xf86FindOptionValue(fPtr->pEnt->device->options,"alpha_swap"))
+	{
+	    if ((fbhandle = open(xf86FindOptionValue(fPtr->pEnt->device->options,"fbdev"), O_RDWR)) < 0) {
+		    xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
+		       "Open framebuffer device failed.\n");
+		return FALSE;
+	    }
+	    xf86DrvMsg(pScrn->scrnIndex, X_INFO, "Meson OSD alpha swap enabled\n");
+	    ret = ioctl(fbhandle, FBIOGET_VSCREENINFO, &info);
+
+	    info.nonstd = 1;
+	    info.transp.length = 0;
+	    info.transp.offset = 24;
+
+            ret = ioctl(fbhandle, FBIOPUT_VSCREENINFO, &info);
+	    close(fbhandle);
+	}
+
 	/* open device */
 	if (!fbdevHWInit(pScrn,NULL,xf86FindOptionValue(fPtr->pEnt->device->options,"fbdev")))
 		return FALSE;
@@ -905,47 +927,17 @@ FBDevScreenInit(SCREEN_INIT_ARGS_DECL)
 	cpu_backend = cpu_backend_init(fPtr->fbmem, pScrn->videoRam);
 	fPtr->cpu_backend_private = cpu_backend;
 
-	/* try to load G2D kernel module before initializing sunxi-disp */
-	if (!xf86LoadKernelModule("g2d_23"))
-		xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-		           "can't load 'g2d_23' kernel module\n");
 
-	fPtr->sunxi_disp_private = sunxi_disp_init(xf86FindOptionValue(
-	                                fPtr->pEnt->device->options,"fbdev"),
-	                                fPtr->fbmem);
-	if (!fPtr->sunxi_disp_private) {
-		xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-		           "failed to enable the use of sunxi display controller\n");
-		fPtr->fb_copyarea_private = fb_copyarea_init(xf86FindOptionValue(
-	                                fPtr->pEnt->device->options,"fbdev"),
-	                                fPtr->fbmem);
-	}
+	fPtr->fb_copyarea_private = fb_copyarea_init(xf86FindOptionValue(
+                                fPtr->pEnt->device->options,"fbdev"),
+                                fPtr->fbmem);
 
-	if (!(accelmethod = xf86GetOptValString(fPtr->Options, OPTION_ACCELMETHOD)) ||
-						strcasecmp(accelmethod, "g2d") == 0) {
-		sunxi_disp_t *disp = fPtr->sunxi_disp_private;
-		if (disp && disp->fd_g2d >= 0 &&
-		    (fPtr->SunxiG2D_private = SunxiG2D_Init(pScreen, &disp->blt2d))) {
-			disp->fallback_blt2d = &cpu_backend->blt2d;
-			xf86DrvMsg(pScrn->scrnIndex, X_INFO, "enabled G2D acceleration\n");
-		}
-		else {
-			xf86DrvMsg(pScreen->myNum, X_INFO,
-				"No sunxi-g2d hardware detected (check /dev/disp and /dev/g2d)\n");
-			xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-				"G2D hardware acceleration can't be enabled\n");
-		}
-	}
-	else {
-		xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-			"G2D acceleration is disabled via AccelMethod option\n");
-	}
 
-	if (!fPtr->SunxiG2D_private && fPtr->fb_copyarea_private) {
+	if (fPtr->fb_copyarea_private) {
 		if (!(accelmethod = xf86GetOptValString(fPtr->Options, OPTION_ACCELMETHOD)) ||
 						strcasecmp(accelmethod, "copyarea") == 0) {
 			fb_copyarea_t *fb = fPtr->fb_copyarea_private;
-			if ((fPtr->SunxiG2D_private = SunxiG2D_Init(pScreen, &fb->blt2d))) {
+			if ((fPtr->FbAccel_private = FbAccel_Init(pScreen, &fb->blt2d))) {
 				fb->fallback_blt2d = &cpu_backend->blt2d;
 				xf86DrvMsg(pScrn->scrnIndex, X_INFO,
 				           "enabled fbdev copyarea acceleration\n");
@@ -961,8 +953,8 @@ FBDevScreenInit(SCREEN_INIT_ARGS_DECL)
 		}
 	}
 
-	if (!fPtr->SunxiG2D_private && cpu_backend->cpuinfo->has_arm_vfp) {
-		if ((fPtr->SunxiG2D_private = SunxiG2D_Init(pScreen, &cpu_backend->blt2d))) {
+	if (cpu_backend->cpuinfo->has_arm_vfp) {
+		if ((fPtr->FbAccel_private = FbAccel_Init(pScreen, &cpu_backend->blt2d))) {
 			xf86DrvMsg(pScrn->scrnIndex, X_INFO, "enabled VFP/NEON optimizations\n");
 		}
 	}
@@ -1038,47 +1030,22 @@ FBDevScreenInit(SCREEN_INIT_ARGS_DECL)
 	pScreen->CloseScreen = FBDevCloseScreen;
 
 #if XV
-	fPtr->SunxiVideo_private = NULL;
-	if (xf86ReturnOptValBool(fPtr->Options, OPTION_XV_OVERLAY, TRUE) &&
-	fPtr->sunxi_disp_private) {
-	    fPtr->SunxiVideo_private = SunxiVideo_Init(pScreen);
-	    if (fPtr->SunxiVideo_private)
-		xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-		           "using sunxi disp layers for X video extension\n");
-	}
-	else {
-	    XF86VideoAdaptorPtr *ptr;
-
-	    int n = xf86XVListGenericAdaptors(pScrn,&ptr);
-	    if (n) {
+	XF86VideoAdaptorPtr *ptr;
+	int n = xf86XVListGenericAdaptors(pScrn,&ptr);
+	if (n) {
 		xf86XVScreenInit(pScreen,ptr,n);
-	    }
 	}
 #endif
 
-	if (fPtr->rotate == FBDEV_ROTATE_NONE &&
-	    !xf86ReturnOptValBool(fPtr->Options, OPTION_SW_CURSOR, FALSE) &&
-	     xf86ReturnOptValBool(fPtr->Options, OPTION_HW_CURSOR, TRUE)) {
-
-	    fPtr->SunxiDispHardwareCursor_private = SunxiDispHardwareCursor_Init(
-	                                pScreen);
-
-	    if (fPtr->SunxiDispHardwareCursor_private)
-		xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-		           "using hardware cursor\n");
-	    else
-		xf86DrvMsg(pScrn->scrnIndex, X_INFO,
-		           "failed to enable hardware cursor\n");
-	}
 
 #ifdef HAVE_LIBUMP
 	if (xf86ReturnOptValBool(fPtr->Options, OPTION_DRI2, TRUE)) {
 
-	    fPtr->SunxiMaliDRI2_private = SunxiMaliDRI2_Init(pScreen,
+	    fPtr->FbdevMaliDRI2_private = FbdevMaliDRI2_Init(pScreen,
 		xf86ReturnOptValBool(fPtr->Options, OPTION_DRI2_OVERLAY, TRUE),
 		xf86ReturnOptValBool(fPtr->Options, OPTION_SWAPBUFFERS_WAIT, TRUE));
 
-	    if (fPtr->SunxiMaliDRI2_private) {
+	    if (fPtr->FbdevMaliDRI2_private) {
 		xf86DrvMsg(pScrn->scrnIndex, X_INFO,
 		           "using DRI2 integration for Mali GPU (UMP buffers)\n");
 		xf86DrvMsg(pScrn->scrnIndex, X_INFO,
@@ -1114,24 +1081,10 @@ FBDevCloseScreen(CLOSE_SCREEN_ARGS_DECL)
 	FBDevPtr fPtr = FBDEVPTR(pScrn);
 
 #ifdef HAVE_LIBUMP
-	if (fPtr->SunxiMaliDRI2_private) {
-	    SunxiMaliDRI2_Close(pScreen);
-	    free(fPtr->SunxiMaliDRI2_private);
-	    fPtr->SunxiMaliDRI2_private = NULL;
-	}
-#endif
-
-	if (fPtr->SunxiDispHardwareCursor_private) {
-	    SunxiDispHardwareCursor_Close(pScreen);
-	    free(fPtr->SunxiDispHardwareCursor_private);
-	    fPtr->SunxiDispHardwareCursor_private = NULL;
-	}
-
-#if XV
-	if (fPtr->SunxiVideo_private) {
-	    SunxiVideo_Close(pScreen);
-	    free(fPtr->SunxiVideo_private);
-	    fPtr->SunxiVideo_private = NULL;
+	if (fPtr->FbdevMaliDRI2_private) {
+	    FbdevMaliDRI2_Close(pScreen);
+	    free(fPtr->FbdevMaliDRI2_private);
+	    fPtr->FbdevMaliDRI2_private = NULL;
 	}
 #endif
 
@@ -1143,18 +1096,14 @@ FBDevCloseScreen(CLOSE_SCREEN_ARGS_DECL)
 	    fPtr->shadow = NULL;
 	}
 
-	if (fPtr->SunxiG2D_private) {
-	    SunxiG2D_Close(pScreen);
-	    free(fPtr->SunxiG2D_private);
-	    fPtr->SunxiG2D_private = NULL;
+	if (fPtr->FbAccel_private) {
+	    FbAccel_Close(pScreen);
+	    free(fPtr->FbAccel_private);
+	    fPtr->FbAccel_private = NULL;
 	}
 	if (fPtr->fb_copyarea_private) {
 	    fb_copyarea_close(fPtr->fb_copyarea_private);
 	    fPtr->fb_copyarea_private = NULL;
-	}
-	if (fPtr->sunxi_disp_private) {
-	    sunxi_disp_close(fPtr->sunxi_disp_private);
-	    fPtr->sunxi_disp_private = NULL;
 	}
 	if (fPtr->cpu_backend_private) {
 	    cpu_backend_close(fPtr->cpu_backend_private);

@@ -13,15 +13,14 @@ fbturbo \- video driver for Allwinner and other ARM-based devices
 .fi
 .SH DESCRIPTION
 .B fbturbo
-is an __xservername__ driver for Allwinner and other ARM-based devices,
+is an __xservername__ driver for ARM-based devices,
 derived from
 .B fbdev
 driver.
 With regard to 2D graphics, it provides a number of software optimizations
 on all platforms, while letting the SIMD (ARM NEON) accelerated code from the
 .B pixman
-library run at full speed without any unnecessary overhead. 2D hardware
-acceleration using G2D is supported on sunxi platforms. The recommended
+library run at full speed without any unnecessary overhead. The recommended
 framebuffer color depths are 16 (RGB565) and 24 (XRGB8888), the other color
 depths may be supported too. Multi-head configurations are supported.
 .SH SUPPORTED HARDWARE
@@ -31,8 +30,7 @@ driver supports all hardware where a framebuffer driver is available and
 uses the os-specific submodule fbdevhw(__drivermansuffix__) to talk
 to the kernel
 device driver.  Currently a fbdevhw module is available for linux.
-Additionally it is intended to use some of the display controller features
-from Allwinner A10/A13 SoC and provide the necessary DRI2 integration with
+Additionally it is intended to provide the necessary DRI2 integration with
 the proprietary OpenGL ES binary blobs for Mali400 GPU (if they are installed
 in the system). The part related to Mali400 GPU support is derived from
 the vendor provided open source
@@ -82,6 +80,10 @@ allocate backing store for all windows.
 .BI "Option \*qHWCursor\*q \*q" boolean \*q
 Enable or disable the HW cursor.  Supported on sunxi platforms. Default: on
 if supported, off otherwise.
+.TP
+.BI "Option \*qalpha_swap\*q \*q" boolean \*q
+Enable or disable transparency hack for Amlogic Meson platform. Set to "true"
+ if you get black windows. Default: off
 .TP
 .BI "Option \*qDRI2\*q \*q" boolean \*q
 Enable or disable DRI2 integration for Mali GPU. Provides hardware

@@ -56,12 +56,9 @@ typedef struct {
 
 	void				*cpu_backend_private;
 	void				*backing_store_tuner_private;
-	void				*sunxi_disp_private;
 	void				*fb_copyarea_private;
-	void				*SunxiDispHardwareCursor_private;
-	void				*SunxiMaliDRI2_private;
-	void				*SunxiG2D_private;
-	void				*SunxiVideo_private;
+	void				*FbdevMaliDRI2_private;
+	void				*FbAccel_private;
 } FBDevRec, *FBDevPtr;
 
 #define FBDEVPTR(p) ((FBDevPtr)((p)->driverPrivate))
@@ -69,17 +66,8 @@ typedef struct {
 #define BACKING_STORE_TUNER(p) ((BackingStoreTuner *) \
                        (FBDEVPTR(p)->backing_store_tuner_private))
 
-#define SUNXI_DISP(p) ((sunxi_disp_t *) \
-                       (FBDEVPTR(p)->sunxi_disp_private))
+#define FB_ACCEL(p) ((FbAccel *) \
+                       (FBDEVPTR(p)->FbAccel_private))
 
-#define SUNXI_G2D(p) ((SunxiG2D *) \
-                       (FBDEVPTR(p)->SunxiG2D_private))
-
-#define SUNXI_DISP_HWC(p) ((SunxiDispHardwareCursor *) \
-                          (FBDEVPTR(p)->SunxiDispHardwareCursor_private))
-
-#define SUNXI_MALI_UMP_DRI2(p) ((SunxiMaliDRI2 *) \
-                                (FBDEVPTR(p)->SunxiMaliDRI2_private))
-
-#define SUNXI_VIDEO(p) ((SunxiVideo *) \
-                        (FBDEVPTR(p)->SunxiVideo_private))
+#define FBDEV_MALI_UMP_DRI2(p) ((FbdevMaliDRI2 *) \
+                                (FBDEVPTR(p)->FbdevMaliDRI2_private))

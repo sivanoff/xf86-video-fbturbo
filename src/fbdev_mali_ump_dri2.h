@@ -21,8 +21,8 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef SUNXI_MALI_UMP_DRI2_H
-#define SUNXI_MALI_UMP_DRI2_H
+#ifndef FBDEV_MALI_UMP_DRI2_H
+#define FBDEV_MALI_UMP_DRI2_H
 
 #include <ump/ump.h>
 #include <ump/ump_ref_drv.h>
@@ -137,8 +137,6 @@ typedef struct {
     Bool                    bWalkingAboveOverlayWin;
 
     Bool                    bHardwareCursorIsInUse;
-    EnableHWCursorProcPtr   EnableHWCursor;
-    DisableHWCursorProcPtr  DisableHWCursor;
 
     DestroyWindowProcPtr    DestroyWindow;
     PostValidateTreeProcPtr PostValidateTree;
@@ -161,11 +159,14 @@ typedef struct {
 
     /* Wait for vsync when swapping DRI2 buffers */
     Bool                    bSwapbuffersWait;
-} SunxiMaliDRI2;
+} FbdevMaliDRI2;
 
-SunxiMaliDRI2 *SunxiMaliDRI2_Init(ScreenPtr pScreen,
+FbdevMaliDRI2 *FbdevMaliDRI2_Init(ScreenPtr pScreen,
                                   Bool      bUseOverlay,
                                   Bool      bSwapbuffersWait);
-void SunxiMaliDRI2_Close(ScreenPtr pScreen);
+void FbdevMaliDRI2_Close(ScreenPtr pScreen);
+
+#define GET_UMP_SECURE_ID_BUF1 _IOWR('m', 310, unsigned int)
+#define GET_UMP_SECURE_ID_BUF2 _IOWR('m', 311, unsigned int)
 
 #endif

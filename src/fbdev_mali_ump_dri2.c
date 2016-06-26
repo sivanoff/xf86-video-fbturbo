@@ -31,6 +31,9 @@
 
 #include <ump/ump.h>
 #include <ump/ump_ref_drv.h>
+#include <linux/fb.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <sys/ioctl.h>
 
@@ -43,10 +46,7 @@
 #include "fb.h"
 
 #include "fbdev_priv.h"
-#include "sunxi_disp.h"
-#include "sunxi_disp_hwcursor.h"
-#include "sunxi_disp_ioctl.h"
-#include "sunxi_mali_ump_dri2.h"
+#include "fbdev_mali_ump_dri2.h"
 
 static const uint32_t crc32_table[256] = {
     0x00000000, 0x77073096, 0xEE0E612C, 0x990951BA, 0x076DC419, 0x706AF48F,
@@ -131,6 +131,8 @@ static Bool test_ump_checksum(UMPBufferInfoPtr umpbuf)
     return calc_ump_checksum(umpbuf, umpbuf->checksum_seed) == umpbuf->checksum;
 }
 
+static int fd_fb = 0;
+
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(a)  (sizeof((a)) / sizeof((a)[0]))
 #endif
@@ -185,7 +187,7 @@ FancyTraverseTree(WindowPtr pWin, VisitWindowProcPtr func, pointer data)
 static int
 WindowWalker(WindowPtr pWin, pointer value)
 {
-    SunxiMaliDRI2 *mali = (SunxiMaliDRI2 *)value;
+    FbdevMaliDRI2 *mali = (FbdevMaliDRI2 *)value;
 
     if (mali->bWalkingAboveOverlayWin) {
         if (pWin->mapped && pWin->realized && pWin->drawable.class != InputOnly) {
@@ -215,7 +217,7 @@ MigratePixmapToUMP(PixmapPtr pPixmap)
 {
     ScreenPtr pScreen = pPixmap->drawable.pScreen;
     ScrnInfoPtr pScrn = xf86Screens[pScreen->myNum];
-    SunxiMaliDRI2 *mali = SUNXI_MALI_UMP_DRI2(pScrn);
+    FbdevMaliDRI2 *mali = FBDEV_MALI_UMP_DRI2(pScrn);
     UMPBufferInfoPtr umpbuf;
     size_t pitch = ((pPixmap->devKind + 7) / 8) * 8;
     size_t size = pitch * pPixmap->drawable.height;
@@ -339,8 +341,7 @@ static DRI2Buffer2Ptr MaliDRI2CreateBuffer(DrawablePtr  pDraw,
     DRI2Buffer2Ptr           buffer;
     UMPBufferInfoPtr         privates;
     ump_handle               handle;
-    SunxiMaliDRI2           *mali = SUNXI_MALI_UMP_DRI2(pScrn);
-    sunxi_disp_t            *disp = SUNXI_DISP(pScrn);
+    FbdevMaliDRI2           *mali = FBDEV_MALI_UMP_DRI2(pScrn);
     Bool                     can_use_overlay = TRUE;
     PixmapPtr                pWindowPixmap;
     DRI2WindowStatePtr       window_state = NULL;
@@ -415,7 +416,7 @@ static DRI2Buffer2Ptr MaliDRI2CreateBuffer(DrawablePtr  pDraw,
     }
 
     /* We could not allocate disp layer or get framebuffer secure id */
-    if (!disp || mali->ump_fb_secure_id == UMP_INVALID_SECURE_ID)
+    if (mali->ump_fb_secure_id == UMP_INVALID_SECURE_ID)
         can_use_overlay = FALSE;
 
     /* Overlay is already used by a different window */
@@ -430,12 +431,6 @@ static DRI2Buffer2Ptr MaliDRI2CreateBuffer(DrawablePtr  pDraw,
     if (pDraw->bitsPerPixel != 32 && pDraw->bitsPerPixel != 16)
         can_use_overlay = FALSE;
 
-    if (disp && disp->framebuffer_size - disp->gfx_layer_size < privates->size * 2) {
-        DebugMsg("Not enough space in the offscreen framebuffer (wanted %d for DRI2)\n",
-                 privates->size);
-        can_use_overlay = FALSE;
-    }
-
     /* Allocate the DRI2-related window bookkeeping information */
     HASH_FIND_PTR(mali->HashWindowState, &pDraw, window_state);
     if (!window_state) {
@@ -443,11 +438,6 @@ static DRI2Buffer2Ptr MaliDRI2CreateBuffer(DrawablePtr  pDraw,
         window_state->pDraw = pDraw;
         HASH_ADD_PTR(mali->HashWindowState, pDraw, window_state);
         DebugMsg("Allocate DRI2 bookkeeping for window %p\n", pDraw);
-        if (disp && can_use_overlay) {
-            /* erase the offscreen part of the framebuffer */
-            memset(disp->framebuffer_addr + disp->gfx_layer_size, 0,
-                   disp->framebuffer_size - disp->gfx_layer_size);
-        }
     }
     window_state->buf_request_cnt++;
 
@@ -465,106 +455,73 @@ static DRI2Buffer2Ptr MaliDRI2CreateBuffer(DrawablePtr  pDraw,
                            pDraw->height != window_state->height) &&
                           mali->ump_null_secure_id <= 2;
 
-    if (can_use_overlay) {
-        /* Release unneeded buffers */
-        if (window_state->ump_mem_buffer_ptr)
-            unref_ump_buffer_info(window_state->ump_mem_buffer_ptr);
-        window_state->ump_mem_buffer_ptr = NULL;
+    /* Release unneeded buffers */
+    if (window_state->ump_back_buffer_ptr)
+    unref_ump_buffer_info(window_state->ump_back_buffer_ptr);
+    window_state->ump_back_buffer_ptr = NULL;
+    if (window_state->ump_front_buffer_ptr)
+    unref_ump_buffer_info(window_state->ump_front_buffer_ptr);
+    window_state->ump_front_buffer_ptr = NULL;
 
-        /* Use offscreen part of the framebuffer as an overlay */
+    if (need_window_resize_bug_workaround) {
+	    DebugMsg("DRI2 buffers size mismatch detected, trying to recover\n");
+
+	if (window_state->ump_mem_buffer_ptr)
+	        unref_ump_buffer_info(window_state->ump_mem_buffer_ptr);
+	window_state->ump_mem_buffer_ptr = NULL;
+
         privates->handle = UMP_INVALID_MEMORY_HANDLE;
-        privates->addr = disp->framebuffer_addr;
-
-        buffer->name = mali->ump_fb_secure_id;
-
-        if (window_state->buf_request_cnt & 1) {
-            buffer->flags = disp->gfx_layer_size;
-            privates->extra_flags |= UMPBUF_MUST_BE_ODD_FRAME;
-        }
-        else {
-            buffer->flags = disp->gfx_layer_size + privates->size;
-            privates->extra_flags |= UMPBUF_MUST_BE_EVEN_FRAME;
-        }
-
-        umpbuf_add_to_queue(window_state, privates);
-        privates->refcount++;
-
-        mali->pOverlayWin = (WindowPtr)pDraw;
-
-        if (need_window_resize_bug_workaround) {
-            DebugMsg("DRI2 buffers size mismatch detected, trying to recover\n");
-            buffer->name = mali->ump_alternative_fb_secure_id;
-        }
+	privates->addr   = NULL;
+        buffer->name     = mali->ump_null_secure_id;
+	return validate_dri2buf(buffer);
     }
-    else {
-        /* Release unneeded buffers */
-        if (window_state->ump_back_buffer_ptr)
-            unref_ump_buffer_info(window_state->ump_back_buffer_ptr);
-        window_state->ump_back_buffer_ptr = NULL;
-        if (window_state->ump_front_buffer_ptr)
-            unref_ump_buffer_info(window_state->ump_front_buffer_ptr);
-        window_state->ump_front_buffer_ptr = NULL;
 
-        if (need_window_resize_bug_workaround) {
-            DebugMsg("DRI2 buffers size mismatch detected, trying to recover\n");
+    /* Reuse the existing UMP buffer if we can */
+    if (window_state->ump_mem_buffer_ptr &&
+        window_state->ump_mem_buffer_ptr->size == privates->size &&
+        window_state->ump_mem_buffer_ptr->depth == privates->depth &&
+        window_state->ump_mem_buffer_ptr->width == privates->width &&
+        window_state->ump_mem_buffer_ptr->height == privates->height) {
 
-            if (window_state->ump_mem_buffer_ptr)
-                unref_ump_buffer_info(window_state->ump_mem_buffer_ptr);
-            window_state->ump_mem_buffer_ptr = NULL;
+        free(privates);
 
-            privates->handle = UMP_INVALID_MEMORY_HANDLE;
-            privates->addr   = NULL;
-            buffer->name     = mali->ump_null_secure_id;
-            return validate_dri2buf(buffer);
-        }
-
-        /* Reuse the existing UMP buffer if we can */
-        if (window_state->ump_mem_buffer_ptr &&
-            window_state->ump_mem_buffer_ptr->size == privates->size &&
-            window_state->ump_mem_buffer_ptr->depth == privates->depth &&
-            window_state->ump_mem_buffer_ptr->width == privates->width &&
-            window_state->ump_mem_buffer_ptr->height == privates->height) {
-
-            free(privates);
-
-            privates = window_state->ump_mem_buffer_ptr;
-            privates->refcount++;
-            buffer->driverPrivate = privates;
-            buffer->name = ump_secure_id_get(privates->handle);
-
-            DebugMsg("Reuse the already allocated UMP buffer %p, ump=%d\n",
-                     privates, buffer->name);
-            return validate_dri2buf(buffer);
-        }
-
-        /* Allocate UMP memory buffer */
-#ifdef HAVE_LIBUMP_CACHE_CONTROL
-        privates->handle = ump_ref_drv_allocate(privates->size,
-                                    UMP_REF_DRV_CONSTRAINT_PHYSICALLY_LINEAR |
-                                    UMP_REF_DRV_CONSTRAINT_USE_CACHE);
-        ump_cache_operations_control(UMP_CACHE_OP_START);
-        ump_switch_hw_usage_secure_id(ump_secure_id_get(privates->handle),
-                                      UMP_USED_BY_MALI);
-        ump_cache_operations_control(UMP_CACHE_OP_FINISH);
-#else
-        privates->handle = ump_ref_drv_allocate(privates->size,
-                                    UMP_REF_DRV_CONSTRAINT_PHYSICALLY_LINEAR);
-#endif
-        if (privates->handle == UMP_INVALID_MEMORY_HANDLE) {
-            ErrorF("Failed to allocate UMP buffer (size=%d)\n",
-                   (int)privates->size);
-        }
-        privates->addr = ump_mapped_pointer_get(privates->handle);
+        privates = window_state->ump_mem_buffer_ptr;
+        privates->refcount++;
+        buffer->driverPrivate = privates;
         buffer->name = ump_secure_id_get(privates->handle);
-        buffer->flags = 0;
 
-        /* Replace the old UMP buffer with the newly allocated one */
-        if (window_state->ump_mem_buffer_ptr)
-            unref_ump_buffer_info(window_state->ump_mem_buffer_ptr);
-
-        window_state->ump_mem_buffer_ptr = privates;
-        privates->refcount++;
+        DebugMsg("Reuse the already allocated UMP buffer %p, ump=%d\n",
+                 privates, buffer->name);
+        return validate_dri2buf(buffer);
     }
+
+    /* Allocate UMP memory buffer */
+#ifdef HAVE_LIBUMP_CACHE_CONTROL
+    privates->handle = ump_ref_drv_allocate(privates->size,
+                                UMP_REF_DRV_CONSTRAINT_PHYSICALLY_LINEAR |
+                                UMP_REF_DRV_CONSTRAINT_USE_CACHE);
+    ump_cache_operations_control(UMP_CACHE_OP_START);
+    ump_switch_hw_usage_secure_id(ump_secure_id_get(privates->handle),
+                                  UMP_USED_BY_MALI);
+    ump_cache_operations_control(UMP_CACHE_OP_FINISH);
+#else
+    privates->handle = ump_ref_drv_allocate(privates->size,
+                                UMP_REF_DRV_CONSTRAINT_PHYSICALLY_LINEAR);
+#endif
+    if (privates->handle == UMP_INVALID_MEMORY_HANDLE) {
+        ErrorF("Failed to allocate UMP buffer (size=%d)\n",
+               (int)privates->size);
+    }
+    privates->addr = ump_mapped_pointer_get(privates->handle);
+    buffer->name = ump_secure_id_get(privates->handle);
+    buffer->flags = 0;
+
+    /* Replace the old UMP buffer with the newly allocated one */
+    if (window_state->ump_mem_buffer_ptr)
+        unref_ump_buffer_info(window_state->ump_mem_buffer_ptr);
+
+    window_state->ump_mem_buffer_ptr = privates;
+    privates->refcount++;
 
     DebugMsg("DRI2CreateBuffer win=%p, buf=%p:%p, att=%d, ump=%d:%d, w=%d, h=%d, cpp=%d, depth=%d\n",
              pDraw, buffer, privates, attachment, buffer->name, buffer->flags,
@@ -573,12 +530,13 @@ static DRI2Buffer2Ptr MaliDRI2CreateBuffer(DrawablePtr  pDraw,
     return validate_dri2buf(buffer);
 }
 
+
 static void MaliDRI2DestroyBuffer(DrawablePtr pDraw, DRI2Buffer2Ptr buffer)
 {
     UMPBufferInfoPtr privates;
     ScreenPtr pScreen = pDraw->pScreen;
     ScrnInfoPtr pScrn = xf86Screens[pScreen->myNum];
-    SunxiMaliDRI2 *mali = SUNXI_MALI_UMP_DRI2(pScrn);
+    FbdevMaliDRI2 *mali = FBDEV_MALI_UMP_DRI2(pScrn);
 
     if (mali->pOverlayDirtyUMP == buffer->driverPrivate)
         mali->pOverlayDirtyUMP = NULL;
@@ -642,7 +600,7 @@ static void MaliDRI2CopyRegion_copy(DrawablePtr      pDraw,
 static void FlushOverlay(ScreenPtr pScreen)
 {
     ScrnInfoPtr pScrn = xf86Screens[pScreen->myNum];
-    SunxiMaliDRI2 *mali = SUNXI_MALI_UMP_DRI2(pScrn);
+    FbdevMaliDRI2 *mali = FBDEV_MALI_UMP_DRI2(pScrn);
 
     if (mali->pOverlayWin && mali->pOverlayDirtyUMP) {
         DebugMsg("Flushing overlay content from DRI2 buffer to window\n");
@@ -701,9 +659,8 @@ static void MaliDRI2CopyRegion(DrawablePtr   pDraw,
 {
     ScreenPtr pScreen = pDraw->pScreen;
     ScrnInfoPtr pScrn = xf86Screens[pScreen->myNum];
-    SunxiMaliDRI2 *mali = SUNXI_MALI_UMP_DRI2(pScrn);
+    FbdevMaliDRI2 *mali = FBDEV_MALI_UMP_DRI2(pScrn);
     UMPBufferInfoPtr umpbuf;
-    sunxi_disp_t *disp = SUNXI_DISP(xf86Screens[pScreen->myNum]);
     DRI2WindowStatePtr window_state = NULL;
     HASH_FIND_PTR(mali->HashWindowState, &pDraw, window_state);
 
@@ -826,16 +783,11 @@ static void MaliDRI2CopyRegion(DrawablePtr   pDraw,
     /* Mark the overlay as "dirty" and remember the last up to date UMP buffer */
     mali->pOverlayDirtyUMP = umpbuf;
 
-    /* Activate the overlay */
-    sunxi_layer_set_output_window(disp, pDraw->x, pDraw->y, pDraw->width, pDraw->height);
-    sunxi_layer_set_rgb_input_buffer(disp, umpbuf->cpp * 8, umpbuf->offs,
-                                     umpbuf->width, umpbuf->height, umpbuf->pitch / 4);
-    sunxi_layer_show(disp);
-
     if (mali->bSwapbuffersWait) {
         /* FIXME: blocking here for up to 1/60 second is not nice */
-        sunxi_wait_for_vsync(disp);
+        ioctl(fd_fb, FBIO_WAITFORVSYNC, 0);
     }
+
 }
 
 /************************************************************************/
@@ -843,28 +795,16 @@ static void MaliDRI2CopyRegion(DrawablePtr   pDraw,
 static void UpdateOverlay(ScreenPtr pScreen)
 {
     ScrnInfoPtr pScrn = xf86Screens[pScreen->myNum];
-    SunxiMaliDRI2 *mali = SUNXI_MALI_UMP_DRI2(pScrn);
-    sunxi_disp_t *disp = SUNXI_DISP(pScrn);
+    FbdevMaliDRI2 *mali = FBDEV_MALI_UMP_DRI2(pScrn);
 
-    if (!mali->pOverlayWin || !disp)
+    if (!mali->pOverlayWin)
         return;
-
-    /* Disable overlays if the hardware cursor is not in use */
-    if (!mali->bHardwareCursorIsInUse) {
-        if (mali->bOverlayWinEnabled) {
-            DebugMsg("Disabling overlay (no hardware cursor)\n");
-            sunxi_layer_hide(disp);
-            mali->bOverlayWinEnabled = FALSE;
-        }
-        return;
-    }
 
     /* If the window is not mapped, make sure that the overlay is disabled */
     if (!mali->pOverlayWin->mapped)
     {
         if (mali->bOverlayWinEnabled) {
             DebugMsg("Disabling overlay (window is not mapped)\n");
-            sunxi_layer_hide(disp);
             mali->bOverlayWinEnabled = FALSE;
         }
         return;
@@ -885,7 +825,6 @@ static void UpdateOverlay(ScreenPtr pScreen)
         DebugMsg("Disabling overlay (window is obscured)\n");
         FlushOverlay(pScreen);
         mali->bOverlayWinEnabled = FALSE;
-        sunxi_layer_hide(disp);
         return;
     }
 
@@ -897,10 +836,6 @@ static void UpdateOverlay(ScreenPtr pScreen)
         mali->overlay_x = mali->pOverlayWin->drawable.x;
         mali->overlay_y = mali->pOverlayWin->drawable.y;
 
-        sunxi_layer_set_output_window(disp, mali->pOverlayWin->drawable.x,
-                                      mali->pOverlayWin->drawable.y,
-                                      mali->pOverlayWin->drawable.width,
-                                      mali->pOverlayWin->drawable.height);
         DebugMsg("Move overlay to (%d, %d)\n", mali->overlay_x, mali->overlay_y);
     }
 
@@ -908,7 +843,6 @@ static void UpdateOverlay(ScreenPtr pScreen)
     if (!mali->bOverlayWinOverlapped && !mali->bOverlayWinEnabled) {
         DebugMsg("Enabling overlay (window is fully unobscured)\n");
         mali->bOverlayWinEnabled = TRUE;
-        sunxi_layer_show(disp);
     }
 }
 
@@ -917,7 +851,7 @@ DestroyWindow(WindowPtr pWin)
 {
     ScreenPtr pScreen = pWin->drawable.pScreen;
     ScrnInfoPtr pScrn = xf86Screens[pScreen->myNum];
-    SunxiMaliDRI2 *mali = SUNXI_MALI_UMP_DRI2(pScrn);
+    FbdevMaliDRI2 *mali = FBDEV_MALI_UMP_DRI2(pScrn);
     Bool ret;
     DrawablePtr pDraw = &pWin->drawable;
     DRI2WindowStatePtr window_state = NULL;
@@ -935,8 +869,6 @@ DestroyWindow(WindowPtr pWin)
     }
 
     if (pWin == mali->pOverlayWin) {
-        sunxi_disp_t *disp = SUNXI_DISP(pScrn);
-        sunxi_layer_hide(disp);
         mali->pOverlayWin = NULL;
         DebugMsg("DestroyWindow %p\n", pWin);
     }
@@ -954,7 +886,7 @@ PostValidateTree(WindowPtr pWin, WindowPtr pLayerWin, VTKind kind)
 {
     ScreenPtr pScreen = pWin ? pWin->drawable.pScreen : pLayerWin->drawable.pScreen;
     ScrnInfoPtr pScrn = xf86Screens[pScreen->myNum];
-    SunxiMaliDRI2 *mali = SUNXI_MALI_UMP_DRI2(pScrn);
+    FbdevMaliDRI2 *mali = FBDEV_MALI_UMP_DRI2(pScrn);
 
     if (mali->PostValidateTree) {
         pScreen->PostValidateTree = mali->PostValidateTree;
@@ -976,7 +908,7 @@ GetImage(DrawablePtr pDrawable, int x, int y, int w, int h,
 {
     ScreenPtr pScreen = pDrawable->pScreen;
     ScrnInfoPtr pScrn = xf86Screens[pScreen->myNum];
-    SunxiMaliDRI2 *mali = SUNXI_MALI_UMP_DRI2(pScrn);
+    FbdevMaliDRI2 *mali = FBDEV_MALI_UMP_DRI2(pScrn);
 
     /* FIXME: more precise check */
     if (mali->pOverlayDirtyUMP)
@@ -995,7 +927,7 @@ DestroyPixmap(PixmapPtr pPixmap)
 {
     ScreenPtr pScreen = pPixmap->drawable.pScreen;
     ScrnInfoPtr pScrn = xf86Screens[pScreen->myNum];
-    SunxiMaliDRI2 *mali = SUNXI_MALI_UMP_DRI2(pScrn);
+    FbdevMaliDRI2 *mali = FBDEV_MALI_UMP_DRI2(pScrn);
     Bool result;
     UMPBufferInfoPtr umpbuf;
     HASH_FIND_PTR(mali->HashPixmapToUMP, &pPixmap, umpbuf);
@@ -1020,46 +952,6 @@ DestroyPixmap(PixmapPtr pPixmap)
     return result;
 }
 
-static void EnableHWCursor(ScrnInfoPtr pScrn)
-{
-    SunxiMaliDRI2 *mali = SUNXI_MALI_UMP_DRI2(pScrn);
-    SunxiDispHardwareCursor *hwc = SUNXI_DISP_HWC(pScrn);
-
-    if (!mali->bHardwareCursorIsInUse) {
-        DebugMsg("EnableHWCursor\n");
-        mali->bHardwareCursorIsInUse = TRUE;
-    }
-
-    UpdateOverlay(screenInfo.screens[pScrn->scrnIndex]);
-
-    if (mali->EnableHWCursor) {
-        hwc->EnableHWCursor = mali->EnableHWCursor;
-        (*hwc->EnableHWCursor) (pScrn);
-        mali->EnableHWCursor = hwc->EnableHWCursor;
-        hwc->EnableHWCursor = EnableHWCursor;
-    }
-}
-
-static void DisableHWCursor(ScrnInfoPtr pScrn)
-{
-    SunxiMaliDRI2 *mali = SUNXI_MALI_UMP_DRI2(pScrn);
-    SunxiDispHardwareCursor *hwc = SUNXI_DISP_HWC(pScrn);
-
-    if (mali->bHardwareCursorIsInUse) {
-        mali->bHardwareCursorIsInUse = FALSE;
-        DebugMsg("DisableHWCursor\n");
-    }
-
-    UpdateOverlay(screenInfo.screens[pScrn->scrnIndex]);
-
-    if (mali->DisableHWCursor) {
-        hwc->DisableHWCursor = mali->DisableHWCursor;
-        (*hwc->DisableHWCursor) (pScrn);
-        mali->DisableHWCursor = hwc->DisableHWCursor;
-        hwc->DisableHWCursor = DisableHWCursor;
-    }
-}
-
 static unsigned long ump_get_size_from_secure_id(ump_secure_id secure_id)
 {
     unsigned long size;
@@ -1078,129 +970,69 @@ static const char *driverNames[1] = {
     "lima" /* DRI2DriverDRI */
 };
 
-static const char *driverNamesWithVDPAU[2] = {
-    "lima", /* DRI2DriverDRI */
-    "sunxi" /* DRI2DriverVDPAU */
-};
-
-SunxiMaliDRI2 *SunxiMaliDRI2_Init(ScreenPtr pScreen,
+FbdevMaliDRI2 *FbdevMaliDRI2_Init(ScreenPtr pScreen,
                                   Bool      bUseOverlay,
                                   Bool      bSwapbuffersWait)
 {
     int drm_fd;
     DRI2InfoRec info = { 0 };
-    SunxiMaliDRI2 *mali;
+    FbdevMaliDRI2 *mali;
     ScrnInfoPtr pScrn = xf86Screens[pScreen->myNum];
-    sunxi_disp_t *disp = SUNXI_DISP(pScrn);
-    Bool have_sunxi_cedar = TRUE;
 
     if (!xf86LoadKernelModule("mali"))
         xf86DrvMsg(pScreen->myNum, X_INFO, "can't load 'mali' kernel module\n");
     if (!xf86LoadKernelModule("mali_drm"))
         xf86DrvMsg(pScreen->myNum, X_INFO, "can't load 'mali_drm' kernel module\n");
 
-    if (!xf86LoadKernelModule("sunxi_cedar_mod")) {
-        xf86DrvMsg(pScreen->myNum, X_INFO, "can't load 'sunxi_cedar_mod' kernel module\n");
-        have_sunxi_cedar = FALSE;
-    }
-
     if (!xf86LoadSubModule(xf86Screens[pScreen->myNum], "dri2"))
         return NULL;
 
     if ((drm_fd = drmOpen("mali_drm", NULL)) < 0) {
-        ErrorF("SunxiMaliDRI2_Init: drmOpen failed!\n");
+        ErrorF("FbdevMaliDRI2_Init: drmOpen failed!\n");
+        return NULL;
+    }
+
+    if ((fd_fb = open("/dev/fb0", O_RDWR)) < 0) {
+        drmClose(drm_fd);
+        ErrorF("FbdevMaliDRI2_Init: open framebuffer failed!\n");
         return NULL;
     }
 
     if (ump_open() != UMP_OK) {
         drmClose(drm_fd);
-        ErrorF("SunxiMaliDRI2_Init: ump_open() != UMP_OK\n");
+	close(fd_fb);
+        ErrorF("FbdevMaliDRI2_Init: ump_open() != UMP_OK\n");
         return NULL;
     }
 
-    if (!(mali = calloc(1, sizeof(SunxiMaliDRI2)))) {
-        ErrorF("SunxiMaliDRI2_Init: calloc failed\n");
+    if (!(mali = calloc(1, sizeof(FbdevMaliDRI2)))) {
+        ErrorF("FbdevMaliDRI2_Init: calloc failed\n");
         return NULL;
     }
 
     mali->ump_alternative_fb_secure_id = UMP_INVALID_SECURE_ID;
 
-    if (disp && bUseOverlay) {
-        /* Try to get UMP framebuffer wrapper with secure id 1 */
-        ioctl(disp->fd_fb, GET_UMP_SECURE_ID_BUF1, &mali->ump_alternative_fb_secure_id);
-        /* Try to allocate a small dummy UMP buffer to secure id 2 */
-        mali->ump_null_handle1 = ump_ref_drv_allocate(4096, UMP_REF_DRV_CONSTRAINT_NONE);
-        if (mali->ump_null_handle1 != UMP_INVALID_MEMORY_HANDLE)
-            mali->ump_null_secure_id = ump_secure_id_get(mali->ump_null_handle1);
-        mali->ump_null_handle2 = UMP_INVALID_MEMORY_HANDLE;
-        /* Try to get UMP framebuffer for the secure id other than 1 and 2 */
-        if (ioctl(disp->fd_fb, GET_UMP_SECURE_ID_SUNXI_FB, &mali->ump_fb_secure_id) ||
-                                   mali->ump_fb_secure_id == UMP_INVALID_SECURE_ID) {
-            xf86DrvMsg(pScreen->myNum, X_INFO,
-                  "GET_UMP_SECURE_ID_SUNXI_FB ioctl failed, overlays can't be used\n");
-            mali->ump_fb_secure_id = UMP_INVALID_SECURE_ID;
-        }
-        if (mali->ump_alternative_fb_secure_id == UMP_INVALID_SECURE_ID ||
-            ump_get_size_from_secure_id(mali->ump_alternative_fb_secure_id) !=
-                                          disp->framebuffer_size) {
-            xf86DrvMsg(pScreen->myNum, X_INFO,
-                  "UMP does not wrap the whole framebuffer, overlays can't be used\n");
-            mali->ump_fb_secure_id = UMP_INVALID_SECURE_ID;
-            mali->ump_alternative_fb_secure_id = UMP_INVALID_SECURE_ID;
-        }
-        if (disp->framebuffer_size - disp->gfx_layer_size <
-                                                 disp->xres * disp->yres * 4 * 2) {
-            int needed_fb_num = (disp->xres * disp->yres * 4 * 2 +
-                                 disp->gfx_layer_size - 1) / disp->gfx_layer_size + 1;
-            xf86DrvMsg(pScreen->myNum, X_INFO,
-                "tear-free zero-copy double buffering needs more video memory\n");
-            xf86DrvMsg(pScreen->myNum, X_INFO,
-                "please set fb0_framebuffer_num >= %d in the fex file\n", needed_fb_num);
-            xf86DrvMsg(pScreen->myNum, X_INFO,
-                "and sunxi_fb_mem_reserve >= %d in the kernel cmdline\n",
-                (needed_fb_num * disp->gfx_layer_size + 1024 * 1024 - 1) / (1024 * 1024));
-        }
-    }
-    else {
-        /* Try to allocate small dummy UMP buffers to secure id 1 and 2 */
-        mali->ump_null_handle1 = ump_ref_drv_allocate(4096, UMP_REF_DRV_CONSTRAINT_NONE);
-        if (mali->ump_null_handle1 != UMP_INVALID_MEMORY_HANDLE)
-            mali->ump_null_secure_id = ump_secure_id_get(mali->ump_null_handle1);
-        mali->ump_null_handle2 = ump_ref_drv_allocate(4096, UMP_REF_DRV_CONSTRAINT_NONE);
-        /* No UMP wrappers for the framebuffer are available */
-        mali->ump_fb_secure_id = UMP_INVALID_SECURE_ID;
-    }
+    /* Try to allocate small dummy UMP buffers to secure id 1 and 2 */
+    mali->ump_null_handle1 = ump_ref_drv_allocate(4096, UMP_REF_DRV_CONSTRAINT_NONE);
+    if (mali->ump_null_handle1 != UMP_INVALID_MEMORY_HANDLE)
+        mali->ump_null_secure_id = ump_secure_id_get(mali->ump_null_handle1);
+    mali->ump_null_handle2 = ump_ref_drv_allocate(4096, UMP_REF_DRV_CONSTRAINT_NONE);
 
-    if (mali->ump_null_secure_id > 2) {
-        xf86DrvMsg(pScreen->myNum, X_INFO,
-                   "warning, can't workaround Mali r3p0 window resize bug\n");
-    }
+    /* No UMP wrappers for the framebuffer are available */
+    mali->ump_fb_secure_id = UMP_INVALID_SECURE_ID;
 
-    if (disp && mali->ump_fb_secure_id != UMP_INVALID_SECURE_ID)
-        xf86DrvMsg(pScreen->myNum, X_INFO,
-              "enabled display controller hardware overlays for DRI2\n");
-    else if (bUseOverlay)
-        xf86DrvMsg(pScreen->myNum, X_INFO,
-              "display controller hardware overlays can't be used for DRI2\n");
-    else
-        xf86DrvMsg(pScreen->myNum, X_INFO,
-              "display controller hardware overlays are not used for DRI2\n");
+    xf86DrvMsg(pScreen->myNum, X_INFO,
+              "display controller hardware overlays are unsupported on meson8/gxbb.\n");
 
     xf86DrvMsg(pScreen->myNum, X_INFO, "Wait on SwapBuffers? %s\n",
                bSwapbuffersWait ? "enabled" : "disabled");
 
     info.version = 4;
 
-    if (have_sunxi_cedar) {
-        info.numDrivers = ARRAY_SIZE(driverNamesWithVDPAU);
-        info.driverName = driverNamesWithVDPAU[0];
-        info.driverNames = driverNamesWithVDPAU;
-    }
-    else {
-        info.numDrivers = ARRAY_SIZE(driverNames);
-        info.driverName = driverNames[0];
-        info.driverNames = driverNames;
-    }
+    info.numDrivers = ARRAY_SIZE(driverNames);
+    info.driverName = driverNames[0];
+    info.driverNames = driverNames;
+
     info.deviceName = drmGetDeviceNameFromFd(drm_fd);
     info.fd = drm_fd;
 
@@ -1210,11 +1042,11 @@ SunxiMaliDRI2 *SunxiMaliDRI2_Init(ScreenPtr pScreen,
 
     if (!DRI2ScreenInit(pScreen, &info)) {
         drmClose(drm_fd);
+	close(fd_fb);
         free(mali);
         return NULL;
     }
     else {
-        SunxiDispHardwareCursor *hwc = SUNXI_DISP_HWC(pScrn);
 
         /* Wrap the current DestroyWindow function */
         mali->DestroyWindow = pScreen->DestroyWindow;
@@ -1229,25 +1061,16 @@ SunxiMaliDRI2 *SunxiMaliDRI2_Init(ScreenPtr pScreen,
         mali->DestroyPixmap = pScreen->DestroyPixmap;
         pScreen->DestroyPixmap = DestroyPixmap;
 
-        /* Wrap hardware cursor callback functions */
-        if (hwc) {
-            mali->EnableHWCursor = hwc->EnableHWCursor;
-            hwc->EnableHWCursor = EnableHWCursor;
-            mali->DisableHWCursor = hwc->DisableHWCursor;
-            hwc->DisableHWCursor = DisableHWCursor;
-        }
-
         mali->drm_fd = drm_fd;
         mali->bSwapbuffersWait = bSwapbuffersWait;
         return mali;
     }
 }
 
-void SunxiMaliDRI2_Close(ScreenPtr pScreen)
+void FbdevMaliDRI2_Close(ScreenPtr pScreen)
 {
     ScrnInfoPtr pScrn = xf86Screens[pScreen->myNum];
-    SunxiMaliDRI2 *mali = SUNXI_MALI_UMP_DRI2(pScrn);
-    SunxiDispHardwareCursor *hwc = SUNXI_DISP_HWC(pScrn);
+    FbdevMaliDRI2 *mali = FBDEV_MALI_UMP_DRI2(pScrn);
 
     /* Unwrap functions */
     pScreen->DestroyWindow    = mali->DestroyWindow;
@@ -1255,16 +1078,12 @@ void SunxiMaliDRI2_Close(ScreenPtr pScreen)
     pScreen->GetImage         = mali->GetImage;
     pScreen->DestroyPixmap    = mali->DestroyPixmap;
 
-    if (hwc) {
-        hwc->EnableHWCursor  = mali->EnableHWCursor;
-        hwc->DisableHWCursor = mali->DisableHWCursor;
-    }
-
     if (mali->ump_null_handle1 != UMP_INVALID_MEMORY_HANDLE)
         ump_reference_release(mali->ump_null_handle1);
     if (mali->ump_null_handle2 != UMP_INVALID_MEMORY_HANDLE)
         ump_reference_release(mali->ump_null_handle2);
 
+    close(fd_fb);
     drmClose(mali->drm_fd);
     DRI2CloseScreen(pScreen);
 }

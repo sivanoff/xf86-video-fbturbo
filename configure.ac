@@ -116,7 +116,6 @@ AC_SUBST([DRIVER_NAME])
 AC_CONFIG_FILES([
                 Makefile
                 src/Makefile
-                test/Makefile
                 man/Makefile
 ])
 AC_OUTPUT

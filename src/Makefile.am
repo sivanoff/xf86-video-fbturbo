@@ -44,19 +44,11 @@ fbturbo_drv_la_SOURCES = \
          interfaces.h \
          fbdev.c \
          fbdev_priv.h \
-         sunxi_disp.c \
-         sunxi_disp.h \
-         sunxi_x_g2d.c \
-         sunxi_x_g2d.h \
-         sunxi_disp_hwcursor.c \
-         sunxi_disp_hwcursor.h \
-         sunxi_video.c \
-         sunxi_video.h \
-         sunxi_disp_ioctl.h \
-         g2d_driver.h
+         fbdev_accel.c \
+         fbdev_accel.h
 
 if HAVE_LIBUMP
 fbturbo_drv_la_SOURCES += \
-         sunxi_mali_ump_dri2.c \
-         sunxi_mali_ump_dri2.h
+         fbdev_mali_ump_dri2.c \
+         fbdev_mali_ump_dri2.h
 endif

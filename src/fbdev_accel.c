@@ -36,7 +36,7 @@
 #include "gcstruct.h"
 
 #include "fbdev_priv.h"
-#include "sunxi_x_g2d.h"
+#include "fbdev_accel.h"
 
 /*
  * The code below is borrowed from "xserver/fb/fbwindow.c"
@@ -62,7 +62,7 @@ xCopyWindowProc(DrawablePtr pSrcDrawable,
     int dstXoff, dstYoff;
     ScreenPtr pScreen = pDstDrawable->pScreen;
     ScrnInfoPtr pScrn = xf86Screens[pScreen->myNum];
-    SunxiG2D *private = SUNXI_G2D(pScrn);
+    FbAccel *private = FB_ACCEL(pScrn);
 
     fbGetDrawable(pSrcDrawable, src, srcStride, srcBpp, srcXoff, srcYoff);
     fbGetDrawable(pDstDrawable, dst, dstStride, dstBpp, dstXoff, dstYoff);
@@ -146,7 +146,7 @@ xCopyNtoN(DrawablePtr pSrcDrawable,
     int dstXoff, dstYoff;
     ScreenPtr pScreen = pDstDrawable->pScreen;
     ScrnInfoPtr pScrn = xf86Screens[pScreen->myNum];
-    SunxiG2D *private = SUNXI_G2D(pScrn);
+    FbAccel *private = FB_ACCEL(pScrn);
 
     fbGetDrawable(pSrcDrawable, src, srcStride, srcBpp, srcXoff, srcYoff);
     fbGetDrawable(pDstDrawable, dst, dstStride, dstBpp, dstXoff, dstYoff);
@@ -247,7 +247,7 @@ static void xPutImage(DrawablePtr pDrawable,
 
     ScreenPtr pScreen = pDrawable->pScreen;
     ScrnInfoPtr pScrn = xf86Screens[pScreen->myNum];
-    SunxiG2D *private = SUNXI_G2D(pScrn);
+    FbAccel *private = FB_ACCEL(pScrn);
 
     src = (FbStip *)pImage;
 
@@ -305,7 +305,7 @@ xCreateGC(GCPtr pGC)
 {
     ScreenPtr pScreen = pGC->pScreen;
     ScrnInfoPtr pScrn = xf86Screens[pScreen->myNum];
-    SunxiG2D *self = SUNXI_G2D(pScrn);
+    FbAccel *self = FB_ACCEL(pScrn);
     Bool result;
 
     if (!fbCreateGC(pGC))
@@ -327,12 +327,12 @@ xCreateGC(GCPtr pGC)
 
 /*****************************************************************************/
 
-SunxiG2D *SunxiG2D_Init(ScreenPtr pScreen, blt2d_i *blt2d)
+FbAccel *FbAccel_Init(ScreenPtr pScreen, blt2d_i *blt2d)
 {
-    SunxiG2D *private = calloc(1, sizeof(SunxiG2D));
+    FbAccel *private = calloc(1, sizeof(FbAccel));
     if (!private) {
         xf86DrvMsg(pScreen->myNum, X_INFO,
-            "SunxiG2D_Init: calloc failed\n");
+            "FbAccel_Init: calloc failed\n");
         return NULL;
     }
 
@@ -351,10 +351,10 @@ SunxiG2D *SunxiG2D_Init(ScreenPtr pScreen, blt2d_i *blt2d)
     return private;
 }
 
-void SunxiG2D_Close(ScreenPtr pScreen)
+void FbAccel_Close(ScreenPtr pScreen)
 {
     ScrnInfoPtr pScrn = xf86Screens[pScreen->myNum];
-    SunxiG2D *private = SUNXI_G2D(pScrn);
+    FbAccel *private = FB_ACCEL(pScrn);
 
     pScreen->CopyWindow = private->CopyWindow;
     pScreen->CreateGC   = private->CreateGC;

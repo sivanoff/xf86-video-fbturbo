@@ -21,21 +21,35 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
-#ifndef SUNXI_DISP_HWCURSOR_H
-#define SUNXI_DISP_HWCURSOR_H
+#ifndef FBDEV_ACCEL_H
+#define FBDEV_ACCEL_H
 
-#include "xf86Cursor.h"
-
-typedef void (*EnableHWCursorProcPtr)(ScrnInfoPtr pScrn);
-typedef void (*DisableHWCursorProcPtr)(ScrnInfoPtr pScrn);
+#include "interfaces.h"
 
 typedef struct {
-    xf86CursorInfoPtr hwcursor;
-    EnableHWCursorProcPtr EnableHWCursor;
-    DisableHWCursorProcPtr DisableHWCursor;
-} SunxiDispHardwareCursor;
+    GCOps                  *pGCOps;
 
-SunxiDispHardwareCursor *SunxiDispHardwareCursor_Init(ScreenPtr pScreen);
-void SunxiDispHardwareCursor_Close(ScreenPtr pScreen);
+    CopyWindowProcPtr       CopyWindow;
+    CreateGCProcPtr         CreateGC;
+
+    /* FbAccel_Init copies these pointers here from blt2d_i struct */
+    void *blt2d_self;
+    int (*blt2d_overlapped_blt)(void     *self,
+                                uint32_t *src_bits,
+                                uint32_t *dst_bits,
+                                int       src_stride,
+                                int       dst_stride,
+                                int       src_bpp,
+                                int       dst_bpp,
+                                int       src_x,
+                                int       src_y,
+                                int       dst_x,
+                                int       dst_y,
+                                int       w,
+                                int       h);
+} FbAccel;
+
+FbAccel *FbAccel_Init(ScreenPtr pScreen, blt2d_i *blt2d);
+void FbAccel_Close(ScreenPtr pScreen);
 
 #endif
